@@ -95,7 +95,15 @@ async def join_and_resolve(link_or_id, label):
             print(f"{label}: already a member (ID: {entity.id}).")
             return entity
     else:
-        entity = await user_client.get_entity(link_or_id)
+        try:
+            entity = await user_client.get_entity(link_or_id)
+        except ValueError:
+            # Entity not cached yet — sync dialogs once and try again.
+            # This handles the case where the account is already a member
+            # of the channel but Telethon hasn't seen it in this session.
+            print(f"{label}: entity not cached, syncing dialogs...")
+            await user_client.get_dialogs(limit=None)
+            entity = await user_client.get_entity(link_or_id)
         print(f"{label}: resolved (ID: {entity.id}).")
         return entity
 
