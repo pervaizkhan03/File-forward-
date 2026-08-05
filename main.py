@@ -197,8 +197,8 @@ async def backfill_source(source_label, source_entity, dest_map):
         scanned += 1
         if scanned % 10 == 0:
             print(f"[{source_label}] Scanned {scanned} messages so far (at ID {message.id})...")
-        if sent_any:
-            await asyncio.sleep(6)  # breathing room for large files
+        # No artificial delay — sends back-to-back. If Telegram issues a FloodWait,
+        # send_with_retry() automatically waits it out and continues.
 
     print(f"[{source_label}] Backfill scan complete ({scanned} messages scanned).")
 
