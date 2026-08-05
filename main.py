@@ -26,6 +26,7 @@ mongo = AsyncIOMotorClient(MONGODB_URI)
 db = mongo["telegram_forwarder"]
 sources_col = db["sources"]           # {label, link, channel_id}
 destinations_col = db["destinations"]  # {label, link, channel_id}
+mappings_col = db["mappings"]          # {source_label, dest_label}
 progress_col = db["progress"]          # {source_label, dest_label, last_id}
 history_col = db["history"]            # {source_label, dest_label, message_id, snippet, ts}
 counters_col = db["counters"]          # {_id: "source_seq"/"dest_seq", seq: N}
@@ -71,6 +72,7 @@ bot_client = TelegramClient("bot_session", API_ID, API_HASH, loop=loop)
 # In-memory active state (kept in sync with MongoDB)
 active_sources = {}       # label -> entity
 active_destinations = {}  # label -> entity
+active_mappings = {}      # source_label -> set of dest_labels
 
 
 # ================= Helpers: join/resolve channels =================
@@ -203,7 +205,9 @@ async def backfill_source(source_label, source_entity, dest_map):
 
 async def backfill_all():
     for s_label, s_entity in list(active_sources.items()):
-        await backfill_source(s_label, s_entity, dict(active_destinations))
+        mapped_labels = active_mappings.get(s_label, set())
+        dest_map = {d: active_destinations[d] for d in mapped_labels if d in active_destinations}
+        await backfill_source(s_label, s_entity, dest_map)
 
 
 # ================= Live listener =================
@@ -216,7 +220,11 @@ async def handle_new_message(event):
     if not source_label:
         return
 
-    for d_label, d_entity in active_destinations.items():
+    mapped_labels = active_mappings.get(source_label, set())
+    for d_label in mapped_labels:
+        d_entity = active_destinations.get(d_label)
+        if not d_entity:
+            continue
         ok = await send_with_retry(event.message, d_entity)
         if ok:
             await save_progress(source_label, d_label, event.message.id)
@@ -245,8 +253,11 @@ async def cmd_addsource(event):
         return
     await sources_col.insert_one({"label": label, "link": link, "channel_id": entity.id})
     active_sources[label] = entity
-    await event.reply(f"✅ Source added as {label}. Starting backfill to all destinations in background...")
-    asyncio.create_task(backfill_source(label, entity, dict(active_destinations)))
+    await event.reply(
+        f"✅ Source added as {label}.\n"
+        f"It won't forward anywhere yet — link it to a destination with:\n"
+        f"/link {label} <destination_label>"
+    )
 
 
 @bot_client.on(events.NewMessage(pattern=r'/adddestination (.+)'))
@@ -261,9 +272,54 @@ async def cmd_adddestination(event):
         return
     await destinations_col.insert_one({"label": label, "link": link, "channel_id": entity.id})
     active_destinations[label] = entity
-    await event.reply(f"✅ Destination added as {label}. Starting catch-up backfill from all sources in background...")
-    for s_label, s_entity in list(active_sources.items()):
-        asyncio.create_task(backfill_source(s_label, s_entity, {label: entity}))
+    await event.reply(
+        f"✅ Destination added as {label}.\n"
+        f"No source is sending to it yet — link one with:\n"
+        f"/link <source_label> {label}"
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r'/link (\S+) (\S+)'))
+@owner_only
+async def cmd_link(event):
+    s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
+    if s_label not in active_sources:
+        await event.reply(f"⚠️ No source with label {s_label}. Check /sources")
+        return
+    if d_label not in active_destinations:
+        await event.reply(f"⚠️ No destination with label {d_label}. Check /destinations")
+        return
+
+    existing = await mappings_col.find_one({"source_label": s_label, "dest_label": d_label})
+    if not existing:
+        await mappings_col.insert_one({"source_label": s_label, "dest_label": d_label})
+    active_mappings.setdefault(s_label, set()).add(d_label)
+
+    await event.reply(f"🔗 Linked {s_label} -> {d_label}. Starting backfill for this pair in background...")
+    asyncio.create_task(backfill_source(s_label, active_sources[s_label], {d_label: active_destinations[d_label]}))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/unlink (\S+) (\S+)'))
+@owner_only
+async def cmd_unlink(event):
+    s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
+    await mappings_col.delete_one({"source_label": s_label, "dest_label": d_label})
+    if s_label in active_mappings:
+        active_mappings[s_label].discard(d_label)
+    await event.reply(f"🔌 Unlinked {s_label} -> {d_label}. Forwarding stopped for this pair (progress kept).")
+
+
+@bot_client.on(events.NewMessage(pattern=r'/mappings'))
+@owner_only
+async def cmd_mappings(event):
+    if not active_mappings or not any(active_mappings.values()):
+        await event.reply("No links set up yet. Use /link <source_label> <dest_label>")
+        return
+    lines = []
+    for s_label, d_labels in active_mappings.items():
+        for d_label in d_labels:
+            lines.append(f"{s_label} -> {d_label}")
+    await event.reply("🔗 Active mappings:\n" + "\n".join(lines) if lines else "No links set up yet.")
 
 
 @bot_client.on(events.NewMessage(pattern=r'/removesource (.+)'))
@@ -272,8 +328,10 @@ async def cmd_removesource(event):
     label = event.pattern_match.group(1).strip()
     if label in active_sources:
         del active_sources[label]
+        active_mappings.pop(label, None)
         await sources_col.delete_one({"label": label})
-        await event.reply(f"🗑️ Source {label} removed (forwarding stopped). Progress history kept in DB.")
+        await mappings_col.delete_many({"source_label": label})
+        await event.reply(f"🗑️ Source {label} removed (forwarding stopped, links cleared). Progress history kept in DB.")
     else:
         await event.reply(f"⚠️ No active source with label {label}.")
 
@@ -284,8 +342,11 @@ async def cmd_removedestination(event):
     label = event.pattern_match.group(1).strip()
     if label in active_destinations:
         del active_destinations[label]
+        for d_labels in active_mappings.values():
+            d_labels.discard(label)
         await destinations_col.delete_one({"label": label})
-        await event.reply(f"🗑️ Destination {label} removed (forwarding stopped). Progress history kept in DB.")
+        await mappings_col.delete_many({"dest_label": label})
+        await event.reply(f"🗑️ Destination {label} removed (forwarding stopped, links cleared). Progress history kept in DB.")
     else:
         await event.reply(f"⚠️ No active destination with label {label}.")
 
@@ -320,11 +381,15 @@ async def cmd_destinations(event):
 @owner_only
 async def cmd_status(event):
     lines = [f"Sources: {len(active_sources)} | Destinations: {len(active_destinations)}", ""]
-    for s_label in active_sources:
-        for d_label in active_destinations:
+    any_mapping = False
+    for s_label, d_labels in active_mappings.items():
+        for d_label in d_labels:
+            any_mapping = True
             p = await get_progress(s_label, d_label)
             lines.append(f"{s_label} -> {d_label}: last forwarded ID {p}")
-    await event.reply("📊 Status:\n" + "\n".join(lines) if len(lines) > 2 else "\n".join(lines))
+    if not any_mapping:
+        lines.append("No links set up yet. Use /link <source_label> <dest_label>")
+    await event.reply("📊 Status:\n" + "\n".join(lines))
 
 
 @bot_client.on(events.NewMessage(pattern=r'/history (\S+) (\S+)'))
@@ -348,6 +413,9 @@ async def cmd_start(event):
         "👋 Forwarder control bot ready.\n\n"
         "/addsource <link>\n"
         "/adddestination <link>\n"
+        "/link <source_label> <dest_label>\n"
+        "/unlink <source_label> <dest_label>\n"
+        "/mappings\n"
         "/removesource <label>\n"
         "/removedestination <label>\n"
         "/sources\n"
@@ -379,11 +447,16 @@ async def main():
         except Exception as e:
             print(f"Failed to load destination {doc['label']}: {e}")
 
-    # Register live listener (checks active_sources dynamically inside handler)
+    # Load existing source->destination mappings
+    async for doc in mappings_col.find({}):
+        active_mappings.setdefault(doc["source_label"], set()).add(doc["dest_label"])
+
+    # Register live listener (checks active_sources/mappings dynamically inside handler)
     user_client.add_event_handler(handle_new_message, events.NewMessage())
 
-    print(f"Loaded {len(active_sources)} source(s), {len(active_destinations)} destination(s).")
-    print("Running initial backfill for all source->destination pairs...")
+    print(f"Loaded {len(active_sources)} source(s), {len(active_destinations)} destination(s), "
+          f"{sum(len(v) for v in active_mappings.values())} mapping(s).")
+    print("Running initial backfill for all linked source->destination pairs...")
     await backfill_all()
 
     print("All backfills complete. Listening for new posts and bot commands...")
