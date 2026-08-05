@@ -23,7 +23,8 @@ MONGODB_URI = os.environ["MONGODB_URI"]
 PORT = int(os.environ.get("PORT", 10000))
 # How many messages can be in-flight (sending) at the same time.
 # Higher = faster, but too high risks Telegram FloodWait penalties on big files.
-CONCURRENCY = int(os.environ.get("CONCURRENCY", 15))
+# Lowered default from 15 -> 4 since large movie files were triggering frequent FloodWaits.
+CONCURRENCY = int(os.environ.get("CONCURRENCY", 4))
 
 # ================= MongoDB setup =================
 mongo = AsyncIOMotorClient(MONGODB_URI)
@@ -185,6 +186,11 @@ async def mark_sent(dest_label, file_id):
 _last_notify_time = 0
 NOTIFY_COOLDOWN_SECONDS = 60  # don't spam the owner more than once a minute
 
+# Global flood-wait cooldown: when Telegram rate-limits us, every other
+# concurrent send waits until this time too, instead of hammering right
+# back into another FloodWait.
+_flood_until = 0.0
+
 
 async def notify_owner(text):
     global _last_notify_time
@@ -198,10 +204,18 @@ async def notify_owner(text):
         print(f"Failed to notify owner: {e}")
 
 
+async def wait_out_global_cooldown():
+    now = asyncio.get_event_loop().time()
+    if now < _flood_until:
+        await asyncio.sleep(_flood_until - now)
+
+
 # ================= Sending =================
 async def send_with_retry(message, dest_entity, max_retries=5):
+    global _flood_until
     cleaned = clean_text(message.text)
     for attempt in range(max_retries):
+        await wait_out_global_cooldown()
         try:
             if message.media:
                 await user_client.send_file(dest_entity, message.media, caption=cleaned or None)
@@ -212,6 +226,7 @@ async def send_with_retry(message, dest_entity, max_retries=5):
         except FloodWaitError as e:
             wait_time = e.seconds + 5
             print(f"FloodWait hit. Sleeping {wait_time}s before retry...")
+            _flood_until = max(_flood_until, asyncio.get_event_loop().time() + wait_time)
             dest_title = getattr(dest_entity, "title", str(getattr(dest_entity, "id", dest_entity)))
             asyncio.create_task(notify_owner(
                 f"⏳ Rate limit (FloodWait) hit while sending to {dest_title}.\n"
@@ -495,6 +510,21 @@ async def cmd_history(event):
         await event.reply(f"🕘 Last forwards ({s_label} -> {d_label}):\n" + "\n".join(lines))
 
 
+@bot_client.on(events.NewMessage(pattern=r'/clearhistory all$'))
+@owner_only
+async def cmd_clearhistory_all(event):
+    result = await history_col.delete_many({})
+    await event.reply(f"🗑️ Cleared ALL history records ({result.deleted_count} entries deleted).")
+
+
+@bot_client.on(events.NewMessage(pattern=r'/clearhistory (\S+) (\S+)'))
+@owner_only
+async def cmd_clearhistory(event):
+    s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
+    result = await history_col.delete_many({"source_label": s_label, "dest_label": d_label})
+    await event.reply(f"🗑️ Cleared history for {s_label} -> {d_label} ({result.deleted_count} entries deleted).")
+
+
 @bot_client.on(events.NewMessage(pattern=r'/start'))
 @owner_only
 async def cmd_start(event):
@@ -510,7 +540,9 @@ async def cmd_start(event):
         "/sources\n"
         "/destinations\n"
         "/status\n"
-        "/history <source_label> <dest_label>"
+        "/history <source_label> <dest_label>\n"
+        "/clearhistory <source_label> <dest_label>\n"
+        "/clearhistory all"
     )
 
 
