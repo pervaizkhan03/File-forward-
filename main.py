@@ -243,55 +243,75 @@ async def send_with_retry(message, dest_entity, max_retries=5):
 async def send_one_pair(source_label, message, d_label, d_entity, progress_tracker):
     """Send a single message to a single destination, respecting the concurrency
     limit and skipping if it's a duplicate or already past this destination's progress."""
-    async with send_semaphore:
-        if message.id <= progress_tracker.get(d_label, 0):
-            return  # this destination already has this message
+    try:
+        async with send_semaphore:
+            if message.id <= progress_tracker.get(d_label, 0):
+                return  # this destination already has this message
 
-        file_id = get_file_id(message)
-        if await already_sent(d_label, file_id):
-            # Same content already forwarded to this destination (maybe from
-            # another source) — skip sending but still move progress forward.
-            await save_progress(source_label, d_label, message.id)
-            return
+            file_id = get_file_id(message)
+            if await already_sent(d_label, file_id):
+                # Same content already forwarded to this destination (maybe from
+                # another source) — skip sending but still move progress forward.
+                await save_progress(source_label, d_label, message.id)
+                return
 
-        ok = await send_with_retry(message, d_entity)
-        if ok:
-            await mark_sent(d_label, file_id)
-            await save_progress(source_label, d_label, message.id)
-            await log_history(source_label, d_label, message.id, message.text)
+            ok = await send_with_retry(message, d_entity)
+            if ok:
+                await mark_sent(d_label, file_id)
+                await save_progress(source_label, d_label, message.id)
+                await log_history(source_label, d_label, message.id, message.text)
+    except Exception as e:
+        # Never let one bad message (or a transient DB/network hiccup) kill the whole batch.
+        print(f"[{source_label} -> {d_label}] Unexpected error on message {message.id}: {e}")
 
 
-async def backfill_source(source_label, source_entity, dest_map):
+async def backfill_source(source_label, source_entity, dest_map, max_retries=10):
     """dest_map: {dest_label: entity}. Each (source, destination) pair tracks its own progress.
-    Sends to all destinations concurrently (bounded by CONCURRENCY) for speed."""
+    Sends to all destinations concurrently (bounded by CONCURRENCY) for speed.
+    Automatically resumes from wherever it left off if the connection drops mid-scan."""
     if not dest_map:
         return
 
-    progress = {d: await get_progress(source_label, d) for d in dest_map}
-    start_id = min(progress.values())
+    for attempt in range(1, max_retries + 1):
+        try:
+            progress = {d: await get_progress(source_label, d) for d in dest_map}
+            start_id = min(progress.values())
 
-    print(f"[{source_label}] Backfill scan starting from message ID {start_id} "
-          f"(covers {len(dest_map)} destination(s), concurrency={CONCURRENCY})...")
+            print(f"[{source_label}] Backfill scan starting from message ID {start_id} "
+                  f"(covers {len(dest_map)} destination(s), concurrency={CONCURRENCY}, attempt {attempt})...")
 
-    scanned = 0
-    pending_tasks = []
-    async for message in user_client.iter_messages(source_entity, reverse=True, min_id=start_id):
-        for d_label, d_entity in dest_map.items():
-            task = asyncio.create_task(send_one_pair(source_label, message, d_label, d_entity, progress))
-            pending_tasks.append(task)
-
-        scanned += 1
-        if scanned % 100 == 0:
-            print(f"[{source_label}] Scanned {scanned} messages so far (at ID {message.id})...")
-            # Flush this batch, then a 1-second breather before the next 100
-            await asyncio.gather(*pending_tasks)
+            scanned = 0
             pending_tasks = []
-            await asyncio.sleep(1)
+            async for message in user_client.iter_messages(source_entity, reverse=True, min_id=start_id):
+                for d_label, d_entity in dest_map.items():
+                    task = asyncio.create_task(send_one_pair(source_label, message, d_label, d_entity, progress))
+                    pending_tasks.append(task)
 
-    if pending_tasks:
-        await asyncio.gather(*pending_tasks)
+                scanned += 1
+                if scanned % 100 == 0:
+                    print(f"[{source_label}] Scanned {scanned} messages so far (at ID {message.id})...")
+                    # Flush this batch, then a 1-second breather before the next 100
+                    await asyncio.gather(*pending_tasks)
+                    pending_tasks = []
+                    await asyncio.sleep(1)
 
-    print(f"[{source_label}] Backfill scan complete ({scanned} messages scanned).")
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks)
+
+            print(f"[{source_label}] Backfill scan complete ({scanned} messages scanned).")
+            return  # success — no need to retry
+
+        except Exception as e:
+            wait_time = min(30 * attempt, 300)  # back off, cap at 5 minutes
+            print(f"[{source_label}] Backfill interrupted ({e}). "
+                  f"Resuming from last saved progress in {wait_time}s (attempt {attempt}/{max_retries})...")
+            asyncio.create_task(notify_owner(
+                f"⚠️ Forwarding for {source_label} was interrupted ({type(e).__name__}). "
+                f"Auto-resuming in {wait_time}s — no action needed."
+            ))
+            await asyncio.sleep(wait_time)
+
+    print(f"[{source_label}] Gave up after {max_retries} retries. Will retry again on next live event or restart.")
 
 
 async def backfill_all():
@@ -303,37 +323,43 @@ async def backfill_all():
 
 # ================= Live listener =================
 async def send_live_pair(source_label, message, d_label, d_entity):
-    async with send_semaphore:
-        file_id = get_file_id(message)
-        if await already_sent(d_label, file_id):
-            await save_progress(source_label, d_label, message.id)
-            return
-        ok = await send_with_retry(message, d_entity)
-        if ok:
-            await mark_sent(d_label, file_id)
-            await save_progress(source_label, d_label, message.id)
-            await log_history(source_label, d_label, message.id, message.text)
-            print(f"[{source_label} -> {d_label}] Forwarded new message {message.id}")
+    try:
+        async with send_semaphore:
+            file_id = get_file_id(message)
+            if await already_sent(d_label, file_id):
+                await save_progress(source_label, d_label, message.id)
+                return
+            ok = await send_with_retry(message, d_entity)
+            if ok:
+                await mark_sent(d_label, file_id)
+                await save_progress(source_label, d_label, message.id)
+                await log_history(source_label, d_label, message.id, message.text)
+                print(f"[{source_label} -> {d_label}] Forwarded new message {message.id}")
+    except Exception as e:
+        print(f"[{source_label} -> {d_label}] Unexpected error on live message {message.id}: {e}")
 
 
 async def handle_new_message(event):
-    source_label = None
-    for label, entity in active_sources.items():
-        if entity.id == event.chat_id:
-            source_label = label
-            break
-    if not source_label:
-        return
+    try:
+        source_label = None
+        for label, entity in active_sources.items():
+            if entity.id == event.chat_id:
+                source_label = label
+                break
+        if not source_label:
+            return
 
-    mapped_labels = active_mappings.get(source_label, set())
-    tasks = []
-    for d_label in mapped_labels:
-        d_entity = active_destinations.get(d_label)
-        if not d_entity:
-            continue
-        tasks.append(asyncio.create_task(send_live_pair(source_label, event.message, d_label, d_entity)))
-    if tasks:
-        await asyncio.gather(*tasks)
+        mapped_labels = active_mappings.get(source_label, set())
+        tasks = []
+        for d_label in mapped_labels:
+            d_entity = active_destinations.get(d_label)
+            if not d_entity:
+                continue
+            tasks.append(asyncio.create_task(send_live_pair(source_label, event.message, d_label, d_entity)))
+        if tasks:
+            await asyncio.gather(*tasks)
+    except Exception as e:
+        print(f"Error in live message handler: {e}")
 
 
 # ================= Bot commands (owner only) =================
@@ -525,6 +551,37 @@ async def cmd_clearhistory(event):
     await event.reply(f"🗑️ Cleared history for {s_label} -> {d_label} ({result.deleted_count} entries deleted).")
 
 
+@bot_client.on(events.NewMessage(pattern=r'/resetall$'))
+@owner_only
+async def cmd_resetall(event):
+    await event.reply(
+        "⚠️ This will permanently delete ALL sources, destinations, links, progress, "
+        "history and duplicate-tracking data — everything restarts from zero (C1/D1 again).\n\n"
+        "This cannot be undone. Type /resetall CONFIRM to proceed."
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r'/resetall CONFIRM$'))
+@owner_only
+async def cmd_resetall_confirm(event):
+    await sources_col.delete_many({})
+    await destinations_col.delete_many({})
+    await mappings_col.delete_many({})
+    await progress_col.delete_many({})
+    await history_col.delete_many({})
+    await dedup_col.delete_many({})
+    await counters_col.delete_many({})
+
+    active_sources.clear()
+    active_destinations.clear()
+    active_mappings.clear()
+
+    await event.reply(
+        "✅ Everything cleared. Labels will restart from C1/D1 next time you add a source/destination.\n"
+        "Use /addsource and /adddestination to start fresh."
+    )
+
+
 @bot_client.on(events.NewMessage(pattern=r'/start'))
 @owner_only
 async def cmd_start(event):
@@ -542,7 +599,8 @@ async def cmd_start(event):
         "/status\n"
         "/history <source_label> <dest_label>\n"
         "/clearhistory <source_label> <dest_label>\n"
-        "/clearhistory all"
+        "/clearhistory all\n"
+        "/resetall (clears everything, restarts from C1/D1)"
     )
 
 
@@ -592,4 +650,12 @@ async def main():
 
 if __name__ == "__main__":
     threading.Thread(target=start_health_server, daemon=True).start()
-    loop.run_until_complete(main())
+    # Outer safety net: if anything unexpected crashes main() (e.g. a startup-time
+    # Mongo/Telegram hiccup), wait a bit and restart instead of dying for good.
+    while True:
+        try:
+            loop.run_until_complete(main())
+            break  # main() only returns normally if run_until_disconnected() finishes cleanly
+        except Exception as e:
+            print(f"Fatal error in main(): {e}. Restarting in 15s...")
+            loop.run_until_complete(asyncio.sleep(15))
