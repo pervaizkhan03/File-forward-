@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, UserAlreadyParticipantError
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -76,6 +76,7 @@ asyncio.set_event_loop(loop)
 user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 # control bot: only talks to the owner to manage sources/destinations
 bot_client = TelegramClient("bot_session", API_ID, API_HASH, loop=loop)
+bot_client.parse_mode = "markdown"  # allows **bold**, `code`, etc. in all replies
 
 # In-memory active state (kept in sync with MongoDB)
 active_sources = {}       # label -> entity
@@ -242,16 +243,14 @@ async def send_with_retry(message, dest_entity, max_retries=5):
 # ================= Backfill: one source -> its destinations =================
 async def send_one_pair(source_label, message, d_label, d_entity, progress_tracker):
     """Send a single message to a single destination, respecting the concurrency
-    limit and skipping if it's a duplicate or already past this destination's progress."""
+    limit and skipping if it's a duplicate (checked via the dedup DB, which is
+    reliable even under concurrency — unlike comparing against the progress
+    number, which can race ahead and cause messages to be silently skipped)."""
     try:
         async with send_semaphore:
-            if message.id <= progress_tracker.get(d_label, 0):
-                return  # this destination already has this message
-
             file_id = get_file_id(message)
             if await already_sent(d_label, file_id):
-                # Same content already forwarded to this destination (maybe from
-                # another source) — skip sending but still move progress forward.
+                # Already forwarded to this destination — just make sure progress reflects it.
                 await save_progress(source_label, d_label, message.id)
                 return
 
@@ -485,41 +484,41 @@ async def cmd_removedestination(event):
 @owner_only
 async def cmd_sources(event):
     if not active_sources:
-        await event.reply("No sources added yet. Use /addsource <link>")
+        await event.reply("📥 No sources added yet.\nUse `/addsource <link>`")
         return
     lines = []
     for label, entity in active_sources.items():
         title = getattr(entity, "title", str(entity.id))
-        lines.append(f"{label}: {title} (ID: {entity.id})")
-    await event.reply("📥 Sources:\n" + "\n".join(lines))
+        lines.append(f"• **{label}** — {title}\n   `ID: {entity.id}`")
+    await event.reply("📥 **Sources**\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines))
 
 
 @bot_client.on(events.NewMessage(pattern=r'/destinations'))
 @owner_only
 async def cmd_destinations(event):
     if not active_destinations:
-        await event.reply("No destinations added yet. Use /adddestination <link>")
+        await event.reply("📤 No destinations added yet.\nUse `/adddestination <link>`")
         return
     lines = []
     for label, entity in active_destinations.items():
         title = getattr(entity, "title", str(entity.id))
-        lines.append(f"{label}: {title} (ID: {entity.id})")
-    await event.reply("📤 Destinations:\n" + "\n".join(lines))
+        lines.append(f"• **{label}** — {title}\n   `ID: {entity.id}`")
+    await event.reply("📤 **Destinations**\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines))
 
 
 @bot_client.on(events.NewMessage(pattern=r'/status'))
 @owner_only
 async def cmd_status(event):
-    lines = [f"Sources: {len(active_sources)} | Destinations: {len(active_destinations)}", ""]
+    lines = [f"📥 Sources: **{len(active_sources)}**   📤 Destinations: **{len(active_destinations)}**", ""]
     any_mapping = False
     for s_label, d_labels in active_mappings.items():
         for d_label in d_labels:
             any_mapping = True
             p = await get_progress(s_label, d_label)
-            lines.append(f"{s_label} -> {d_label}: last forwarded ID {p}")
+            lines.append(f"🔗 **{s_label} → {d_label}** — last forwarded ID `{p}`")
     if not any_mapping:
-        lines.append("No links set up yet. Use /link <source_label> <dest_label>")
-    await event.reply("📊 Status:\n" + "\n".join(lines))
+        lines.append("No links set up yet. Use `/link <source> <dest>`")
+    await event.reply("📊 **Status**\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines))
 
 
 @bot_client.on(events.NewMessage(pattern=r'/history (\S+) (\S+)'))
@@ -549,6 +548,90 @@ async def cmd_clearhistory(event):
     s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
     result = await history_col.delete_many({"source_label": s_label, "dest_label": d_label})
     await event.reply(f"🗑️ Cleared history for {s_label} -> {d_label} ({result.deleted_count} entries deleted).")
+
+
+async def run_check_missing(chat_id, s_label, s_entity, d_label, d_entity, always_notify=True):
+    """chat_id=None means this was an automatic run — only message the owner if
+    something was actually missing (avoids noisy notifications every cycle)."""
+    checked = 0
+    forwarded = 0
+    async for message in user_client.iter_messages(s_entity, reverse=True):
+        checked += 1
+        try:
+            file_id = get_file_id(message)
+            if not await already_sent(d_label, file_id):
+                ok = await send_with_retry(message, d_entity)
+                if ok:
+                    await mark_sent(d_label, file_id)
+                    await save_progress(s_label, d_label, message.id)
+                    await log_history(s_label, d_label, message.id, message.text)
+                    forwarded += 1
+        except Exception as e:
+            print(f"[checkmissing {s_label}->{d_label}] Error on message {message.id}: {e}")
+
+        if checked % 200 == 0:
+            print(f"[checkmissing {s_label}->{d_label}] Checked {checked}, forwarded {forwarded} missing so far...")
+            await asyncio.sleep(1)
+
+    print(f"[checkmissing {s_label}->{d_label}] Done. Checked {checked}, forwarded {forwarded} missing.")
+
+    if always_notify or forwarded > 0:
+        target = chat_id if chat_id else OWNER_ID
+        try:
+            await bot_client.send_message(
+                target,
+                f"✅ Missing-post check done for {s_label} -> {d_label}.\n"
+                f"Checked {checked} total posts, forwarded {forwarded} that were missing."
+            )
+        except Exception as e:
+            print(f"Failed to send checkmissing completion message: {e}")
+
+
+# ================= Automatic periodic missing-post check =================
+AUTO_CHECK_INTERVAL_HOURS = float(os.environ.get("AUTO_CHECK_INTERVAL_HOURS", 6))
+
+
+async def auto_check_loop():
+    if AUTO_CHECK_INTERVAL_HOURS <= 0:
+        print("Auto-check disabled (AUTO_CHECK_INTERVAL_HOURS <= 0).")
+        return
+    while True:
+        await asyncio.sleep(AUTO_CHECK_INTERVAL_HOURS * 3600)
+        print("Running automatic missing-post check for all linked pairs...")
+        for s_label, d_labels in list(active_mappings.items()):
+            s_entity = active_sources.get(s_label)
+            if not s_entity:
+                continue
+            for d_label in list(d_labels):
+                d_entity = active_destinations.get(d_label)
+                if not d_entity:
+                    continue
+                try:
+                    # always_notify=False: stay quiet unless something was actually missing
+                    await run_check_missing(None, s_label, s_entity, d_label, d_entity, always_notify=False)
+                except Exception as e:
+                    print(f"[auto-check] Error checking {s_label}->{d_label}: {e}")
+
+
+@bot_client.on(events.NewMessage(pattern=r'/checkmissing (\S+) (\S+)'))
+@owner_only
+async def cmd_checkmissing(event):
+    s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
+    if s_label not in active_sources:
+        await event.reply(f"⚠️ No source with label {s_label}. Check /sources")
+        return
+    if d_label not in active_destinations:
+        await event.reply(f"⚠️ No destination with label {d_label}. Check /destinations")
+        return
+
+    await event.reply(
+        f"🔍 Checking all posts in {s_label} against {d_label} for anything missed. "
+        f"This runs in the background and can take a while for large channels — "
+        f"I'll message you when it's done."
+    )
+    asyncio.create_task(run_check_missing(
+        event.chat_id, s_label, active_sources[s_label], d_label, active_destinations[d_label]
+    ))
 
 
 @bot_client.on(events.NewMessage(pattern=r'/resetall$'))
@@ -586,22 +669,57 @@ async def cmd_resetall_confirm(event):
 @owner_only
 async def cmd_start(event):
     await event.reply(
-        "👋 Forwarder control bot ready.\n\n"
-        "/addsource <link>\n"
-        "/adddestination <link>\n"
-        "/link <source_label> <dest_label>\n"
-        "/unlink <source_label> <dest_label>\n"
-        "/mappings\n"
-        "/removesource <label>\n"
-        "/removedestination <label>\n"
-        "/sources\n"
-        "/destinations\n"
-        "/status\n"
-        "/history <source_label> <dest_label>\n"
-        "/clearhistory <source_label> <dest_label>\n"
-        "/clearhistory all\n"
-        "/resetall (clears everything, restarts from C1/D1)"
+        "🎬 **Forward Bot — Control Panel**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Manage sources, destinations and links right from here.\n\n"
+        "**📥 Sources & 📤 Destinations**\n"
+        "`/addsource <link>`\n"
+        "`/adddestination <link>`\n"
+        "`/removesource <label>`\n"
+        "`/removedestination <label>`\n"
+        "`/sources`  •  `/destinations`\n\n"
+        "**🔗 Linking**\n"
+        "`/link <source> <dest>`\n"
+        "`/unlink <source> <dest>`\n"
+        "`/mappings`\n\n"
+        "**📊 Monitoring**\n"
+        "`/status`\n"
+        "`/history <source> <dest>`\n\n"
+        "**🧹 Maintenance**\n"
+        "`/checkmissing <source> <dest>` — re-scan & forward anything missed\n"
+        f"⏱ Auto-check runs every **{AUTO_CHECK_INTERVAL_HOURS}h** automatically\n"
+        "`/clearhistory <source> <dest>` / `/clearhistory all`\n"
+        "`/resetall` — wipe everything, start fresh from C1/D1\n"
+        "━━━━━━━━━━━━━━━━━━━━",
+        buttons=[
+            [Button.text("📥 Sources", resize=True), Button.text("📤 Destinations", resize=True)],
+            [Button.text("🔗 Mappings", resize=True), Button.text("📊 Status", resize=True)],
+        ]
     )
+
+
+@bot_client.on(events.NewMessage(pattern=r'^📥 Sources$'))
+@owner_only
+async def btn_sources(event):
+    await cmd_sources(event)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^📤 Destinations$'))
+@owner_only
+async def btn_destinations(event):
+    await cmd_destinations(event)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🔗 Mappings$'))
+@owner_only
+async def btn_mappings(event):
+    await cmd_mappings(event)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^📊 Status$'))
+@owner_only
+async def btn_status(event):
+    await cmd_status(event)
 
 
 # ================= Startup =================
@@ -641,7 +759,9 @@ async def main():
     print("Running initial backfill for all linked source->destination pairs...")
     await backfill_all()
 
-    print("All backfills complete. Listening for new posts and bot commands...")
+    print(f"All backfills complete. Starting automatic missing-post checks every "
+          f"{AUTO_CHECK_INTERVAL_HOURS}h, and listening for new posts and bot commands...")
+    asyncio.create_task(auto_check_loop())
     await asyncio.gather(
         user_client.run_until_disconnected(),
         bot_client.run_until_disconnected(),
