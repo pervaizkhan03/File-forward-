@@ -442,13 +442,16 @@ async def cmd_unlink(event):
 @owner_only
 async def cmd_mappings(event):
     if not active_mappings or not any(active_mappings.values()):
-        await event.reply("No links set up yet. Use /link <source_label> <dest_label>")
+        await event.reply(
+            "🔗 **Mappings**\n━━━━━━━━━━━━━━━━━━━━\n"
+            "No links set up yet. Use `/link <source> <dest>`"
+        )
         return
     lines = []
     for s_label, d_labels in active_mappings.items():
         for d_label in d_labels:
-            lines.append(f"{s_label} -> {d_label}")
-    await event.reply("🔗 Active mappings:\n" + "\n".join(lines) if lines else "No links set up yet.")
+            lines.append(f"• **{s_label}** → **{d_label}**")
+    await event.reply("🔗 **Mappings**\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines))
 
 
 @bot_client.on(events.NewMessage(pattern=r'/removesource (.+)'))
@@ -528,11 +531,13 @@ async def cmd_history(event):
     cursor = history_col.find({"source_label": s_label, "dest_label": d_label}).sort("ts", -1).limit(5)
     lines = []
     async for doc in cursor:
-        lines.append(f"ID {doc['message_id']}: {doc['snippet']}")
+        lines.append(f"• `{doc['message_id']}` — {doc['snippet'] or '(media, no caption)'}")
     if not lines:
-        await event.reply("No history found for this pair yet.")
+        await event.reply(f"🕘 **History — {s_label} → {d_label}**\n━━━━━━━━━━━━━━━━━━━━\nNothing forwarded yet.")
     else:
-        await event.reply(f"🕘 Last forwards ({s_label} -> {d_label}):\n" + "\n".join(lines))
+        await event.reply(
+            f"🕘 **History — {s_label} → {d_label}**\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines)
+        )
 
 
 @bot_client.on(events.NewMessage(pattern=r'/clearhistory all$'))
@@ -694,8 +699,15 @@ async def cmd_start(event):
         buttons=[
             [Button.text("📥 Sources", resize=True), Button.text("📤 Destinations", resize=True)],
             [Button.text("🔗 Mappings", resize=True), Button.text("📊 Status", resize=True)],
+            [Button.text("❓ Help", resize=True)],
         ]
     )
+
+
+@bot_client.on(events.NewMessage(pattern=r'^❓ Help$'))
+@owner_only
+async def btn_help(event):
+    await cmd_start(event)
 
 
 @bot_client.on(events.NewMessage(pattern=r'^📥 Sources$'))
