@@ -82,6 +82,7 @@ bot_client.parse_mode = "markdown"  # allows **bold**, `code`, etc. in all repli
 active_sources = {}       # label -> entity
 active_destinations = {}  # label -> entity
 active_mappings = {}      # source_label -> set of dest_labels
+pending_action = {}       # OWNER_ID -> "addsource" / "adddestination" / "link" / "unlink" (awaiting next plain message)
 
 
 # ================= Helpers: join/resolve channels =================
@@ -370,10 +371,8 @@ def owner_only(func):
     return wrapper
 
 
-@bot_client.on(events.NewMessage(pattern=r'/addsource (.+)'))
-@owner_only
-async def cmd_addsource(event):
-    link = event.pattern_match.group(1).strip()
+async def do_add_source(event, link):
+    link = link.strip()
     label = await next_label("source")
     try:
         entity = await join_and_resolve(link, label)
@@ -383,16 +382,27 @@ async def cmd_addsource(event):
     await sources_col.insert_one({"label": label, "link": link, "channel_id": entity.id})
     active_sources[label] = entity
     await event.reply(
-        f"✅ Source added as {label}.\n"
+        f"✅ Source added as **{label}**.\n"
         f"It won't forward anywhere yet — link it to a destination with:\n"
-        f"/link {label} <destination_label>"
+        f"`/link {label} <destination_label>`"
     )
 
 
-@bot_client.on(events.NewMessage(pattern=r'/adddestination (.+)'))
+@bot_client.on(events.NewMessage(pattern=r'/addsource (.+)'))
 @owner_only
-async def cmd_adddestination(event):
-    link = event.pattern_match.group(1).strip()
+async def cmd_addsource(event):
+    await do_add_source(event, event.pattern_match.group(1))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/addsource$'))
+@owner_only
+async def cmd_addsource_prompt(event):
+    pending_action[OWNER_ID] = "addsource"
+    await event.reply("📥 Send the channel invite link (or @username) for the new **source** now.")
+
+
+async def do_add_destination(event, link):
+    link = link.strip()
     label = await next_label("destination")
     try:
         entity = await join_and_resolve(link, label)
@@ -402,10 +412,23 @@ async def cmd_adddestination(event):
     await destinations_col.insert_one({"label": label, "link": link, "channel_id": entity.id})
     active_destinations[label] = entity
     await event.reply(
-        f"✅ Destination added as {label}.\n"
+        f"✅ Destination added as **{label}**.\n"
         f"No source is sending to it yet — link one with:\n"
-        f"/link <source_label> {label}"
+        f"`/link <source_label> {label}`"
     )
+
+
+@bot_client.on(events.NewMessage(pattern=r'/adddestination (.+)'))
+@owner_only
+async def cmd_adddestination(event):
+    await do_add_destination(event, event.pattern_match.group(1))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/adddestination$'))
+@owner_only
+async def cmd_adddestination_prompt(event):
+    pending_action[OWNER_ID] = "adddestination"
+    await event.reply("📤 Send the channel invite link (or @username) for the new **destination** now.")
 
 
 @bot_client.on(events.NewMessage(pattern=r'/link (\S+) (\S+)'))
@@ -428,6 +451,13 @@ async def cmd_link(event):
     asyncio.create_task(backfill_source(s_label, active_sources[s_label], {d_label: active_destinations[d_label]}))
 
 
+@bot_client.on(events.NewMessage(pattern=r'/link$'))
+@owner_only
+async def cmd_link_prompt(event):
+    pending_action[OWNER_ID] = "link"
+    await event.reply("🔗 Send the source and destination labels separated by a space, e.g. `C1 D1`")
+
+
 @bot_client.on(events.NewMessage(pattern=r'/unlink (\S+) (\S+)'))
 @owner_only
 async def cmd_unlink(event):
@@ -436,6 +466,13 @@ async def cmd_unlink(event):
     if s_label in active_mappings:
         active_mappings[s_label].discard(d_label)
     await event.reply(f"🔌 Unlinked {s_label} -> {d_label}. Forwarding stopped for this pair (progress kept).")
+
+
+@bot_client.on(events.NewMessage(pattern=r'/unlink$'))
+@owner_only
+async def cmd_unlink_prompt(event):
+    pending_action[OWNER_ID] = "unlink"
+    await event.reply("🔌 Send the source and destination labels separated by a space, e.g. `C1 D1`")
 
 
 @bot_client.on(events.NewMessage(pattern=r'/mappings'))
@@ -454,10 +491,8 @@ async def cmd_mappings(event):
     await event.reply("🔗 **Mappings**\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines))
 
 
-@bot_client.on(events.NewMessage(pattern=r'/removesource (.+)'))
-@owner_only
-async def cmd_removesource(event):
-    label = event.pattern_match.group(1).strip()
+async def do_remove_source(event, label):
+    label = label.strip()
     if label in active_sources:
         del active_sources[label]
         active_mappings.pop(label, None)
@@ -468,10 +503,21 @@ async def cmd_removesource(event):
         await event.reply(f"⚠️ No active source with label {label}.")
 
 
-@bot_client.on(events.NewMessage(pattern=r'/removedestination (.+)'))
+@bot_client.on(events.NewMessage(pattern=r'/removesource (.+)'))
 @owner_only
-async def cmd_removedestination(event):
-    label = event.pattern_match.group(1).strip()
+async def cmd_removesource(event):
+    await do_remove_source(event, event.pattern_match.group(1))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/removesource$'))
+@owner_only
+async def cmd_removesource_prompt(event):
+    pending_action[OWNER_ID] = "removesource"
+    await event.reply("🗑️ Send the source label to remove (check /sources), e.g. `C1`")
+
+
+async def do_remove_destination(event, label):
+    label = label.strip()
     if label in active_destinations:
         del active_destinations[label]
         for d_labels in active_mappings.values():
@@ -481,6 +527,19 @@ async def cmd_removedestination(event):
         await event.reply(f"🗑️ Destination {label} removed (forwarding stopped, links cleared). Progress history kept in DB.")
     else:
         await event.reply(f"⚠️ No active destination with label {label}.")
+
+
+@bot_client.on(events.NewMessage(pattern=r'/removedestination (.+)'))
+@owner_only
+async def cmd_removedestination(event):
+    await do_remove_destination(event, event.pattern_match.group(1))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/removedestination$'))
+@owner_only
+async def cmd_removedestination_prompt(event):
+    pending_action[OWNER_ID] = "removedestination"
+    await event.reply("🗑️ Send the destination label to remove (check /destinations), e.g. `D1`")
 
 
 @bot_client.on(events.NewMessage(pattern=r'/sources'))
@@ -524,10 +583,7 @@ async def cmd_status(event):
     await event.reply("📊 **Status**\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines))
 
 
-@bot_client.on(events.NewMessage(pattern=r'/history (\S+) (\S+)'))
-@owner_only
-async def cmd_history(event):
-    s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
+async def do_history(event, s_label, d_label):
     cursor = history_col.find({"source_label": s_label, "dest_label": d_label}).sort("ts", -1).limit(5)
     lines = []
     async for doc in cursor:
@@ -540,6 +596,19 @@ async def cmd_history(event):
         )
 
 
+@bot_client.on(events.NewMessage(pattern=r'/history (\S+) (\S+)'))
+@owner_only
+async def cmd_history(event):
+    await do_history(event, event.pattern_match.group(1), event.pattern_match.group(2))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/history$'))
+@owner_only
+async def cmd_history_prompt(event):
+    pending_action[OWNER_ID] = "history"
+    await event.reply("🕘 Send the source and destination labels separated by a space, e.g. `C1 D1`")
+
+
 @bot_client.on(events.NewMessage(pattern=r'/clearhistory all$'))
 @owner_only
 async def cmd_clearhistory_all(event):
@@ -547,12 +616,25 @@ async def cmd_clearhistory_all(event):
     await event.reply(f"🗑️ Cleared ALL history records ({result.deleted_count} entries deleted).")
 
 
+async def do_clear_history(event, s_label, d_label):
+    result = await history_col.delete_many({"source_label": s_label, "dest_label": d_label})
+    await event.reply(f"🗑️ Cleared history for {s_label} -> {d_label} ({result.deleted_count} entries deleted).")
+
+
 @bot_client.on(events.NewMessage(pattern=r'/clearhistory (\S+) (\S+)'))
 @owner_only
 async def cmd_clearhistory(event):
-    s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
-    result = await history_col.delete_many({"source_label": s_label, "dest_label": d_label})
-    await event.reply(f"🗑️ Cleared history for {s_label} -> {d_label} ({result.deleted_count} entries deleted).")
+    await do_clear_history(event, event.pattern_match.group(1), event.pattern_match.group(2))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/clearhistory$'))
+@owner_only
+async def cmd_clearhistory_prompt(event):
+    pending_action[OWNER_ID] = "clearhistory"
+    await event.reply(
+        "🧹 Send the source and destination labels separated by a space (e.g. `C1 D1`), "
+        "or send `all` to clear everything."
+    )
 
 
 async def run_check_missing(chat_id, s_label, s_entity, d_label, d_entity, always_notify=True):
@@ -618,25 +700,49 @@ async def auto_check_loop():
                     print(f"[auto-check] Error checking {s_label}->{d_label}: {e}")
 
 
-@bot_client.on(events.NewMessage(pattern=r'/checkmissing (\S+) (\S+)'))
-@owner_only
-async def cmd_checkmissing(event):
-    s_label, d_label = event.pattern_match.group(1), event.pattern_match.group(2)
+async def do_check_missing(event, s_label, d_labels):
     if s_label not in active_sources:
         await event.reply(f"⚠️ No source with label {s_label}. Check /sources")
         return
-    if d_label not in active_destinations:
-        await event.reply(f"⚠️ No destination with label {d_label}. Check /destinations")
+
+    valid, invalid = [], []
+    for d in d_labels:
+        (valid if d in active_destinations else invalid).append(d)
+
+    if invalid:
+        await event.reply(f"⚠️ Unknown destination(s): {', '.join(invalid)}. Check /destinations")
+        return
+    if not valid:
+        await event.reply("⚠️ No valid destination labels given.")
         return
 
     await event.reply(
-        f"🔍 Checking all posts in {s_label} against {d_label} for anything missed. "
+        f"🔍 Checking all posts in **{s_label}** against **{', '.join(valid)}** for anything missed. "
         f"This runs in the background and can take a while for large channels — "
-        f"I'll message you when it's done."
+        f"I'll message you when each one is done."
     )
-    asyncio.create_task(run_check_missing(
-        event.chat_id, s_label, active_sources[s_label], d_label, active_destinations[d_label]
-    ))
+    for d_label in valid:
+        asyncio.create_task(run_check_missing(
+            event.chat_id, s_label, active_sources[s_label], d_label, active_destinations[d_label]
+        ))
+
+
+@bot_client.on(events.NewMessage(pattern=r'/checkmissing (\S+) (.+)'))
+@owner_only
+async def cmd_checkmissing(event):
+    s_label = event.pattern_match.group(1)
+    d_labels = event.pattern_match.group(2).split()
+    await do_check_missing(event, s_label, d_labels)
+
+
+@bot_client.on(events.NewMessage(pattern=r'/checkmissing$'))
+@owner_only
+async def cmd_checkmissing_prompt(event):
+    pending_action[OWNER_ID] = "checkmissing"
+    await event.reply(
+        "🔍 Send the source label followed by one or more destination labels, "
+        "separated by spaces, e.g. `C1 D1 D2`"
+    )
 
 
 @bot_client.on(events.NewMessage(pattern=r'/resetall$'))
@@ -691,14 +797,21 @@ async def cmd_start(event):
         "`/status`\n"
         "`/history <source> <dest>`\n\n"
         "**🧹 Maintenance**\n"
-        "`/checkmissing <source> <dest>` — re-scan & forward anything missed\n"
+        "`/checkmissing <source> <dest1> [dest2] [dest3]...` — re-scan & forward anything missed\n"
         f"⏱ Auto-check runs every **{AUTO_CHECK_INTERVAL_HOURS}h** automatically\n"
         "`/clearhistory <source> <dest>` / `/clearhistory all`\n"
         "`/resetall` — wipe everything, start fresh from C1/D1\n"
-        "━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 Tip: tap **➕ Add Source** / **➕ Add Destination** / **🔗 Link** / **🔌 Unlink** below "
+        "and I'll ask you for the details — no need to type the full command.",
         buttons=[
+            [Button.text("➕ Add Source", resize=True), Button.text("➕ Add Destination", resize=True)],
+            [Button.text("🗑️ Remove Source", resize=True), Button.text("🗑️ Remove Destination", resize=True)],
+            [Button.text("🔗 Link", resize=True), Button.text("🔌 Unlink", resize=True)],
             [Button.text("📥 Sources", resize=True), Button.text("📤 Destinations", resize=True)],
             [Button.text("🔗 Mappings", resize=True), Button.text("📊 Status", resize=True)],
+            [Button.text("🕘 History", resize=True), Button.text("🔍 Check Missing", resize=True)],
+            [Button.text("🧹 Clear History", resize=True), Button.text("♻️ Reset All", resize=True)],
             [Button.text("❓ Help", resize=True)],
         ]
     )
@@ -732,6 +845,154 @@ async def btn_mappings(event):
 @owner_only
 async def btn_status(event):
     await cmd_status(event)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^➕ Add Source$'))
+@owner_only
+async def btn_addsource(event):
+    pending_action[OWNER_ID] = "addsource"
+    await event.reply("📥 Send the channel invite link (or @username) for the new **source** now.")
+
+
+@bot_client.on(events.NewMessage(pattern=r'^➕ Add Destination$'))
+@owner_only
+async def btn_adddestination(event):
+    pending_action[OWNER_ID] = "adddestination"
+    await event.reply("📤 Send the channel invite link (or @username) for the new **destination** now.")
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🗑️ Remove Source$'))
+@owner_only
+async def btn_removesource(event):
+    pending_action[OWNER_ID] = "removesource"
+    await event.reply("🗑️ Send the source label to remove (check /sources), e.g. `C1`")
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🗑️ Remove Destination$'))
+@owner_only
+async def btn_removedestination(event):
+    pending_action[OWNER_ID] = "removedestination"
+    await event.reply("🗑️ Send the destination label to remove (check /destinations), e.g. `D1`")
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🔗 Link$'))
+@owner_only
+async def btn_link(event):
+    pending_action[OWNER_ID] = "link"
+    await event.reply("🔗 Send the source and destination labels separated by a space, e.g. `C1 D1`")
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🔌 Unlink$'))
+@owner_only
+async def btn_unlink(event):
+    pending_action[OWNER_ID] = "unlink"
+    await event.reply("🔌 Send the source and destination labels separated by a space, e.g. `C1 D1`")
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🕘 History$'))
+@owner_only
+async def btn_history(event):
+    pending_action[OWNER_ID] = "history"
+    await event.reply("🕘 Send the source and destination labels separated by a space, e.g. `C1 D1`")
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🔍 Check Missing$'))
+@owner_only
+async def btn_checkmissing(event):
+    pending_action[OWNER_ID] = "checkmissing"
+    await event.reply(
+        "🔍 Send the source label followed by one or more destination labels, "
+        "separated by spaces, e.g. `C1 D1 D2`"
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r'^🧹 Clear History$'))
+@owner_only
+async def btn_clearhistory(event):
+    pending_action[OWNER_ID] = "clearhistory"
+    await event.reply(
+        "🧹 Send the source and destination labels separated by a space (e.g. `C1 D1`), "
+        "or send `all` to clear everything."
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r'^♻️ Reset All$'))
+@owner_only
+async def btn_resetall(event):
+    await cmd_resetall(event)
+
+
+@bot_client.on(events.NewMessage())
+@owner_only
+async def catch_pending_input(event):
+    """Handles the plain-text follow-up after tapping a button like ➕ Add Source
+    (or sending the bare command, e.g. /addsource with no link)."""
+    text = event.raw_text.strip()
+    if text.startswith('/') or text.startswith(('➕', '🔗', '🔌', '📥', '📤', '📊', '🔍', '🧹', '♻️', '❓', '🗑️', '🕘')):
+        return  # a real command or button label — already handled elsewhere
+
+    action = pending_action.get(OWNER_ID)
+    if not action:
+        return  # no pending action, nothing to do with random text
+
+    pending_action.pop(OWNER_ID, None)
+
+    if action == "addsource":
+        await do_add_source(event, text)
+    elif action == "adddestination":
+        await do_add_destination(event, text)
+    elif action == "removesource":
+        await do_remove_source(event, text)
+    elif action == "removedestination":
+        await do_remove_destination(event, text)
+    elif action in ("link", "unlink"):
+        parts = text.split()
+        if len(parts) != 2:
+            await event.reply("⚠️ Please send exactly two labels separated by a space, e.g. `C1 D1`")
+            return
+        s_label, d_label = parts
+        if action == "link":
+            if s_label not in active_sources:
+                await event.reply(f"⚠️ No source with label {s_label}. Check /sources")
+                return
+            if d_label not in active_destinations:
+                await event.reply(f"⚠️ No destination with label {d_label}. Check /destinations")
+                return
+            existing = await mappings_col.find_one({"source_label": s_label, "dest_label": d_label})
+            if not existing:
+                await mappings_col.insert_one({"source_label": s_label, "dest_label": d_label})
+            active_mappings.setdefault(s_label, set()).add(d_label)
+            await event.reply(f"🔗 Linked {s_label} -> {d_label}. Starting backfill for this pair in background...")
+            asyncio.create_task(backfill_source(
+                s_label, active_sources[s_label], {d_label: active_destinations[d_label]}
+            ))
+        else:
+            await mappings_col.delete_one({"source_label": s_label, "dest_label": d_label})
+            if s_label in active_mappings:
+                active_mappings[s_label].discard(d_label)
+            await event.reply(f"🔌 Unlinked {s_label} -> {d_label}. Forwarding stopped (progress kept).")
+    elif action == "history":
+        parts = text.split()
+        if len(parts) != 2:
+            await event.reply("⚠️ Please send exactly two labels separated by a space, e.g. `C1 D1`")
+            return
+        await do_history(event, parts[0], parts[1])
+    elif action == "clearhistory":
+        if text.lower() == "all":
+            result = await history_col.delete_many({})
+            await event.reply(f"🗑️ Cleared ALL history records ({result.deleted_count} entries deleted).")
+            return
+        parts = text.split()
+        if len(parts) != 2:
+            await event.reply("⚠️ Please send exactly two labels (e.g. `C1 D1`) or `all`.")
+            return
+        await do_clear_history(event, parts[0], parts[1])
+    elif action == "checkmissing":
+        parts = text.split()
+        if len(parts) < 2:
+            await event.reply("⚠️ Please send a source label followed by one or more destination labels, e.g. `C1 D1 D2`")
+            return
+        await do_check_missing(event, parts[0], parts[1:])
 
 
 # ================= Startup =================
